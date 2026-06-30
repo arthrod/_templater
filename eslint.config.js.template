@@ -1,0 +1,154 @@
+// Copy to project root as `eslint.config.js` (flat config, ESLint 9+).
+//
+// Install peers:
+//   npm i -D eslint @eslint/js typescript-eslint \
+//           eslint-plugin-import-x eslint-plugin-unused-imports
+//   # React projects also: npm i -D eslint-plugin-react-hooks  (see opt-in block below)
+//
+// TYPE-AWARE LINTING (default): this config extends `strictTypeChecked`, which
+// turns on the highest-value rules (`no-floating-promises`, `no-misused-promises`,
+// `await-thenable`, `no-unnecessary-condition`). These require type information,
+// so the project MUST have a working `tsconfig.json` that includes the linted
+// files — `projectService: true` discovers it automatically.
+//
+// No tsconfig.json yet? Either add one, or drop the type-aware tier: replace
+// `...tseslint.configs.strictTypeChecked` with `...tseslint.configs.strict` and
+// delete the `languageOptions.parserOptions` block below. You lose the async-
+// safety rules but the config loads without project info.
+//
+// Formatting is intentionally NOT handled here — run Prettier separately
+// (`npx prettier --check .`). `strict`/`strictTypeChecked` ship no formatting
+// rules, so there's nothing for Prettier to conflict with; do NOT add
+// eslint-plugin-prettier / eslint-config-prettier.
+
+import js from '@eslint/js';
+import tseslint from 'typescript-eslint';
+import importX from 'eslint-plugin-import-x';
+import unusedImports from 'eslint-plugin-unused-imports';
+
+export default tseslint.config(
+  {
+    // Build output / vendored code is not ours to lint. Adjust per project.
+    ignores: ['dist/**', 'build/**', 'coverage/**', 'node_modules/**'],
+  },
+  js.configs.recommended,
+  ...tseslint.configs.strictTypeChecked,
+  {
+    languageOptions: {
+      parserOptions: {
+        // Auto-discovers the nearest tsconfig.json for each file (typed linting).
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    plugins: {
+      'import-x': importX,
+      'unused-imports': unusedImports,
+    },
+    rules: {
+      // Structure
+      'max-depth': ['error', 3],
+      'complexity': ['error', 10],
+      'max-lines-per-function': ['error', { max: 80, skipComments: true, skipBlankLines: true }],
+      'max-lines': ['error', { max: 500, skipComments: true, skipBlankLines: true }],
+      'no-else-return': 'error',
+
+      // Debug leaks
+      'no-console': 'error',
+
+      // Async safety (type-aware) — the single biggest reason to run typed
+      // linting. A floating promise is the #1 silent-failure class in TS/React.
+      '@typescript-eslint/no-floating-promises': 'error',
+      '@typescript-eslint/no-misused-promises': 'error',
+
+      // Exhaustiveness (type-aware) — the one widely-recommended typed rule no
+      // preset (incl. strictTypeChecked) turns on. Fails the build when a switch
+      // over a discriminated union / enum misses a member: the classic bug where
+      // an agent adds a variant and updates some switch sites but not all, and
+      // tsc stays silent because a default or void-return swallows it.
+      // considerDefaultExhaustiveForUnions treats an existing default as
+      // exhaustive, which kills the main false-positive source.
+      '@typescript-eslint/switch-exhaustiveness-check': ['error', { considerDefaultExhaustiveForUnions: true }],
+
+      // TypeScript discipline
+      '@typescript-eslint/no-explicit-any': ['error', { ignoreRestArgs: false }],
+      '@typescript-eslint/explicit-module-boundary-types': 'error',
+
+      // Import hygiene — parity with ruff's `I` (sort) + `F401` (unused) on the
+      // Python side. unused-imports owns unused detection (it autofixes), so the
+      // typescript-eslint twin is turned off to avoid double-reporting.
+      '@typescript-eslint/no-unused-vars': 'off',
+      'unused-imports/no-unused-imports': 'error',
+      'unused-imports/no-unused-vars': ['error', {
+        argsIgnorePattern: '^_',
+        varsIgnorePattern: '^_',
+      }],
+      'import-x/order': ['error', {
+        'newlines-between': 'always',
+        alphabetize: { order: 'asc', caseInsensitive: true },
+        groups: ['builtin', 'external', 'internal', 'parent', 'sibling', 'index'],
+      }],
+      'import-x/no-duplicates': 'error',
+
+      // Error-context preservation. `catch (e) { throw new Error('failed') }`
+      // discards the original cause/stack — the #1 AI-agent diagnosability bug;
+      // the fix is `new Error(msg, { cause: e })` (an editor suggestion, not a
+      // safe autofix). The rule exists since ESLint v9.35.0 but only entered
+      // `eslint:recommended` in v10.0.0, so pinning it here gives v9.35+ users
+      // the same guardrail and removes the v9/v10 behaviour fork. (Requires
+      // ESLint ≥ 9.35 — earlier 9.x will error on the unknown rule name.)
+      'preserve-caught-error': 'error',
+    },
+  },
+
+  // ── OPT-IN: React projects ────────────────────────────────────────────────
+  // Uncomment + `npm i -D eslint-plugin-react-hooks`. Kept opt-in because plenty
+  // of TypeScript projects (Node services, libraries, Vue) aren't React.
+  // Add at the top with the other imports:
+  //   import reactHooks from 'eslint-plugin-react-hooks';
+  // The v6 plugin ships flat-config presets — use the preset, don't hand-wire:
+  //   { ...reactHooks.configs.flat.recommended, files: ['**/*.{jsx,tsx}'] },
+  //     // ^ stable: rules-of-hooks + exhaustive-deps + classic correctness
+  // Or opt into the React Compiler-powered rules (set-state-in-render, mutation,
+  // purity) — higher signal, but newer/experimental:
+  //   { ...reactHooks.configs.flat['recommended-latest'], files: ['**/*.{jsx,tsx}'] },
+
+  // ── OPT-IN: accessibility (React/JSX) ─────────────────────────────────────
+  // Uncomment + `npm i -D eslint-plugin-jsx-a11y`. Catches a11y issues AI-
+  // generated JSX commonly ships: unlabeled inputs, missing alt text, click
+  // handlers on non-interactive elements — invisible to tsc and unit tests.
+  //   import jsxA11y from 'eslint-plugin-jsx-a11y';
+  //   { files: ['**/*.{jsx,tsx}'], ...jsxA11y.flatConfigs.recommended },
+
+  // ── OPT-IN: erasable-syntax discipline ────────────────────────────────────
+  // Uncomment if you run .ts files directly via Node type-stripping or build
+  // with --erasableSyntaxOnly. `enum` and parameter properties are non-erasable
+  // syntax (they emit runtime code), so they break `node file.ts`. Not default-on
+  // because enums compile fine under tsc/bundlers and parameter properties are
+  // the standard NestJS/DI idiom. (Projects with their own tsconfig can instead
+  // set "erasableSyntaxOnly": true for the compiler-level equivalent.)
+  // {
+  //   files: ['**/*.ts'],
+  //   rules: {
+  //     'no-restricted-syntax': ['error',
+  //       { selector: 'TSEnumDeclaration', message: 'Use a const object + union type — enum is non-erasable syntax (breaks Node type-stripping).' },
+  //       { selector: 'TSParameterProperty', message: 'Declare class fields explicitly — parameter properties are non-erasable syntax.' },
+  //     ],
+  //   },
+  // },
+
+  {
+    // Plain JS/JSX has no type info — disable type-aware rules so the parser
+    // doesn't error on files outside the TS project graph (config files, etc.).
+    files: ['**/*.{js,cjs,mjs,jsx}'],
+    extends: [tseslint.configs.disableTypeChecked],
+  },
+  {
+    // Test files get looser rules.
+    files: ['**/*.test.ts', '**/*.test.tsx', '**/*.spec.ts', '**/*.spec.tsx'],
+    rules: {
+      'max-lines-per-function': 'off',
+      '@typescript-eslint/no-explicit-any': 'off',
+    },
+  },
+);

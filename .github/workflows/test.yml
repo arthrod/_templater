@@ -1,0 +1,79 @@
+name: tests
+
+# Runs the scaffold's own test harness against a throwaway git repo.
+# Cross-platform matrix catches portability bugs in the hook (BSD vs GNU
+# grep, file-iteration edge cases) before they hit consumer projects.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: Install actionlint
+        # Validates the rendered lint.yml is a parseable GitHub Actions
+        # workflow — guards against the job-level `if: hashFiles(...)` class
+        # of error that silently disables every job. The download script is
+        # pinned to a COMMIT SHA, not the mutable v1.7.12 tag, so a moved tag
+        # or a compromised release can't swap the script under us. The `1.7.12`
+        # arg is the actionlint version the (pinned) script then downloads.
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          # SHA is rhysd/actionlint tag v1.7.12.
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash) 1.7.12 "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Static-audit our own workflows (zizmor)
+        # Machine-verifies the CI hardening the scaffold claims — SHA-pinned
+        # actions, persist-credentials: false, least-privilege permissions — so a
+        # regression (an unpinned action, a re-introduced credential persist)
+        # fails the build instead of rotting silently. Pinned version; --offline
+        # keeps it hermetic (no GITHUB_TOKEN, only the static audits). zizmor only
+        # accepts .yml/.yaml, so the *.yml.template files are rendered into a temp
+        # dir first. Maintainer CI only — NOT installed into consumer repos.
+        run: |
+          pip install zizmor==1.25.2
+          render="$RUNNER_TEMP/wf"
+          mkdir -p "$render"
+          for f in .github/workflows/*.yml.template; do
+            cp "$f" "$render/$(basename "$f" .template)"
+          done
+          zizmor --offline --persona regular .github/workflows/*.yml "$render"/*.yml
+      - name: Check action pins agree across real workflows and templates
+        # Dependabot bumps SHA pins only in real *.yml workflows — it never parses
+        # *.yml.template, so the templates silently rot one checkout-bump behind
+        # (the v6.0.2/v6.0.3 drift that prompted this guard). Assert every action
+        # resolves to a SINGLE SHA across both real and template files; if one
+        # appears with two distinct SHAs, the templates need a manual catch-up.
+        # Maintainer CI only — NOT installed into consumer repos.
+        run: |
+          drift="$(grep -rhoE 'uses: [A-Za-z0-9_./-]+@[0-9a-f]{40}' \
+                     .github/workflows/*.yml .github/workflows/*.yml.template \
+                   | sed -E 's/^uses: //' | sort -u | sed -E 's/@.*//' | sort | uniq -d)"
+          if [ -n "$drift" ]; then
+            echo "::error::Action pin drift — these actions have differing SHAs between"
+            echo "real workflows and *.yml.template files (Dependabot only bumps the"
+            echo "real *.yml; bump the templates to match):"
+            # shellcheck disable=SC2001  # sed prepends a bullet to each line of multi-line $drift; ${//} has no per-line ^ anchor
+            echo "$drift" | sed 's/^/  - /'
+            exit 1
+          fi
+          echo "All action pins agree across real workflows and templates."
+      - run: chmod +x tests/run.sh install.sh githooks/pre-commit.template
+      - run: ./tests/run.sh

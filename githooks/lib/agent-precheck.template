@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# .githooks/lib/agent-precheck — agent PreToolUse hook (scaffold "layer three":
+# block bad content the moment an agent writes it, before commit time).
+#
+# Wired for two agent runtimes that both deliver the event as JSON on stdin and
+# both treat EXIT 2 as "block this action":
+#   - Claude Code  (.claude/settings.json PreToolUse, matcher Write|Edit|Bash) —
+#     command lives under .tool_input.command, tool name under .tool_name.
+#   - Cursor       (.cursor/hooks.json beforeShellExecution)                   —
+#     command lives at the TOP LEVEL .command, with NO .tool_name field.
+# The extraction below is written to cover both shapes; see the two notes inline.
+#
+# Scans the content a Write/Edit is about to introduce — and the text of a Bash
+# command — against the SAME patterns the commit-time scanner uses. One source
+# of truth across agent -> commit -> CI:
+#   - .forbidden-patterns/secrets.txt  (all tool calls, case-insensitive) — a
+#     credential the agent tries to hardcode is refused at write time.
+#   - .forbidden-patterns/shell.txt    (Bash tool calls only, case-sensitive to
+#     match the commit-time semantics) — curl|bash, rm -rf /, chmod 777 etc. are
+#     refused before the agent runs them. RECOMMENDATIONS.md calls this the
+#     single highest-ROI agent hook.
+#
+# The hook BLOCKS by exiting 2; both runtimes feed the stderr text back to the
+# model so it can correct course.
+#
+# Requires `jq`. If jq is missing, or no secrets.txt is present, it exits 0
+# (fail-OPEN) — an agent helper must never brick the session; the pre-commit
+# hook and CI are the authoritative fail-CLOSED backstops.
+#
+# Exit: 0 = allow, 2 = block (stderr shown to the model).
+
+set -euo pipefail
+
+command -v jq >/dev/null 2>&1 || exit 0
+
+payload=$(cat)
+
+# Project root: Claude Code exports CLAUDE_PROJECT_DIR. Fall back to the cwd the
+# event reports, then to ".".
+ROOT=${CLAUDE_PROJECT_DIR:-}
+[ -n "$ROOT" ] || ROOT=$(jq -r '.cwd // "."' <<<"$payload" 2>/dev/null || echo .)
+
+tool=$(jq -r '.tool_name // empty' <<<"$payload" 2>/dev/null || true)
+
+# Pull every string value out of the event regardless of the tool's field names
+# (Claude: Write.content, Edit.new_string, MultiEdit edits[].new_string,
+# Bash.command; Cursor: top-level .command). `(.tool_input // .)` walks
+# .tool_input when present (Claude) and otherwise the whole payload (Cursor,
+# which has no .tool_input) — so a Cursor command at the top level is still
+# scanned instead of silently failing open. `.. | strings` then walks the whole
+# subtree, staying correct even if a tool's schema changes.
+content=$(jq -r '[(.tool_input // .) | .. | strings] | join("\n")' <<<"$payload" 2>/dev/null || true)
+[ -n "$content" ] || exit 0
+
+# Drop pathologically long lines (a minified bundle pasted into a Write) so the
+# combined ERE can't be made to hang — same guard as check-secrets.
+MAX_LINE_LENGTH=${MAX_LINE_LENGTH:-50000}
+content=$(printf '%s\n' "$content" | awk -v n="$MAX_LINE_LENGTH" 'length > n { next } { print }')
+[ -n "$content" ] || exit 0
+
+# scan_against <patternfile> <i|""> <advice line>
+#   Loads + validates patterns (mirror of check-secrets' parsing), builds the
+#   combined ERE, scans $content. On a match (minus scaffold-allow lines) it
+#   prints a BLOCKED message naming the file and EXITS 2. The case flag is `i`
+#   for secrets (case-insensitive) and "" for shell (case-sensitive — matches
+#   the commit-time check-patterns semantics). A missing file or an unparseable
+#   pattern set returns cleanly (fail-OPEN: this is an advisory pre-check, not
+#   the security boundary — commit + CI are the fail-closed backstops).
+scan_against() {
+  local pfile=$1 iflag=$2 advice=$3
+  [ -f "$pfile" ] || return 0
+  local patterns=() line pattern p_err combined p hit
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    [ -z "$line" ] && continue
+    case "$line" in \#*) continue ;; esac
+    case "$line" in *$'\t'*) ;; *) continue ;; esac
+    pattern=${line%%$'\t'*}
+    [ -z "$pattern" ] && continue
+    # `printf '' | grep -E p` writes to stderr only when p is invalid — drop it.
+    p_err=$(printf '' | grep -E -- "$pattern" 2>&1 1>/dev/null || true)
+    [ -z "$p_err" ] || continue
+    patterns+=("$pattern")
+  done <"$pfile"
+  [ ${#patterns[@]} -eq 0 ] && return 0
+
+  combined=""
+  for p in "${patterns[@]}"; do
+    if [ -z "$combined" ]; then combined="(${p})"; else combined="${combined}|(${p})"; fi
+  done
+  p_err=$(printf '' | grep -E -- "$combined" 2>&1 1>/dev/null || true)
+  [ -z "$p_err" ] || return 0
+
+  # A comment-anchored `scaffold-allow` exempts a line, exactly like the scanners.
+  hit=$(printf '%s\n' "$content" | grep -an"${iflag}"E -- "$combined" \
+          | grep -ivE '(^|[[:space:]])(#|//|/\*|<!--)[[:space:]]*scaffold-allow' || true)
+  [ -n "$hit" ] || return 0
+
+  {
+    echo "BLOCKED by agent-precheck: $advice"
+    echo "(${pfile#"$ROOT"/}). If this is deliberate and safe, append a comment"
+    echo "containing 'scaffold-allow' on the matching line."
+    echo "Matched:"
+    # `|| true`: on a many-line $hit, `head -3` closes the pipe early and printf
+    # takes SIGPIPE (exit 141). Under `set -euo pipefail` that would abort the
+    # script BEFORE the `exit 2` below — and the agent runtimes treat only exit 2
+    # as "block", so a non-2 exit silently ALLOWS the matched action (fail-open).
+    printf '%s\n' "$hit" | head -3 || true
+  } >&2
+  exit 2
+}
+
+# Secrets: every tool call, case-insensitive.
+scan_against "$ROOT/.forbidden-patterns/secrets.txt" i \
+  "this content matches a secret pattern — don't hardcode credentials; read them from an env var or secret manager"
+
+# Shell: command executions only, case-sensitive (commit-time semantics).
+# Claude reports tool_name "Bash"; Cursor's beforeShellExecution has no
+# tool_name but carries the command at the top-level .command — gate on either,
+# or the scan would silently skip every Cursor shell call (fail-open).
+shellcmd=$(jq -r '.command // empty' <<<"$payload" 2>/dev/null || true)
+if [ "$tool" = "Bash" ] || [ -n "$shellcmd" ]; then
+  scan_against "$ROOT/.forbidden-patterns/shell.txt" "" \
+    "this command matches a dangerous shell pattern (e.g. curl|bash, rm -rf /, chmod 777) — don't run it"
+fi
+
+exit 0

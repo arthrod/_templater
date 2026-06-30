@@ -1,0 +1,367 @@
+name: lint
+
+# Copy to your project as `.github/workflows/lint.yml`.
+# Mirrors the pre-commit hook server-side via the same lib/check-* scripts —
+# the hook and CI can never drift because they share one implementation.
+# Adjust Python / Node versions per project.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    # Detection runs as a step (after checkout), NOT a job-level `if:`.
+    # `hashFiles()` is only valid once a runner is assigned and the repo is
+    # checked out — using it in a job-level `if:` makes GitHub reject the
+    # WHOLE workflow as invalid, silently disabling every job including
+    # guardrails. The job always starts; its tool steps no-op when the
+    # configs are absent (frontend-only repos see a green, empty python job).
+    runs-on: ubuntu-latest
+    # Diff-scoped: ruff lints only files CHANGED in this PR/push, so installing
+    # the scaffold onto an existing project never retroactively fails the whole
+    # tree of pre-existing code. New/changed code is fully gated; legacy is
+    # grandfathered until it's next touched. fetch-depth: 0 gives the diff a base.
+    env:
+      EVENT: ${{ github.event_name }}
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PUSH_BEFORE: ${{ github.event.before }}
+      PUSH_AFTER: ${{ github.event.after }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false  # don't leave GITHUB_TOKEN in .git/config
+          fetch-depth: 0              # full history so the PR/push diff resolves
+      - id: detect
+        run: |
+          if [ -f ruff.toml ] || [ -f pyproject.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+      - if: steps.detect.outputs.present == 'true'
+        run: pip install ruff
+      - name: ruff check (changed files only)
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          # .githooks/lib/ci-changed-files resolves the PR/push diff (NUL list),
+          # failing open to the whole tree when there's no diff base. One shared
+          # implementation, unit-tested in tests/cases/10.
+          bash .githooks/lib/ci-changed-files >changed.nul
+          # Portable NUL read (bash 3.2-safe — same idiom as the check-* scripts);
+          # avoids `mapfile`, which predates bash 4 and is absent on some runners.
+          py=()
+          while IFS= read -r -d '' f; do case "$f" in *.py) py+=("$f") ;; esac; done <changed.nul
+          if [ ${#py[@]} -eq 0 ]; then echo "no changed Python files — skipping ruff"; exit 0; fi
+          printf 'ruff: linting %d changed Python file(s)\n' "${#py[@]}"
+          ruff check -- "${py[@]}"
+
+  frontend:
+    # Same pattern as `python` — detect in a step, not a job-level `if:`.
+    # Diff-scoped too: eslint + prettier check only the PR/push diff (tsc is
+    # whole-program, see its step). fetch-depth: 0 gives the diff a base.
+    runs-on: ubuntu-latest
+    env:
+      EVENT: ${{ github.event_name }}
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PUSH_BEFORE: ${{ github.event.before }}
+      PUSH_AFTER: ${{ github.event.after }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false  # don't leave GITHUB_TOKEN in .git/config
+          fetch-depth: 0              # full history so the PR/push diff resolves
+      - id: detect
+        run: |
+          if [ -f eslint.config.js ] || [ -f package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        if: steps.detect.outputs.present == 'true'
+        # Frozen-lockfile install when a lockfile exists (reproducible, and it
+        # hard-fails on lockfile drift instead of silently mutating it like
+        # `npm install`). Falls back to `npm install` only when there's no
+        # lockfile, so a lockfile-less repo still works. pnpm/yarn equivalents:
+        # `pnpm install --frozen-lockfile --ignore-scripts` /
+        # `yarn install --immutable --mode=skip-build`.
+        #
+        # --ignore-scripts: eslint and tsc are pure JS, so the lint job never
+        # needs a dependency's install hooks — and this runner holds GITHUB_TOKEN
+        # and repo/org secrets, the exact target the Shai-Hulud 2.0 preinstall
+        # worm went after. Not executing arbitrary pre/postinstall scripts is
+        # cheap CI hardening. Escape hatch: if a dep your lint chain genuinely
+        # needs builds a native binary in a lifecycle script (esbuild, @swc/core,
+        # sharp, cypress), add a follow-up `npm rebuild <pkg>` step rather than
+        # dropping the flag.
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci --ignore-scripts
+          else
+            echo "no package-lock.json — using npm install (add a lockfile for reproducible CI)"
+            npm install --ignore-scripts
+          fi
+      - name: Compute changed files
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          # NUL-delimited list of files changed in this PR/push (shared by the
+          # eslint + prettier steps below — the workspace persists across steps).
+          # ci-changed-files fails open to the whole tree when there's no diff
+          # base; same shared helper the python + guardrails jobs use.
+          bash .githooks/lib/ci-changed-files >changed.nul
+      - name: ESLint (changed files only)
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          # eslint must LOAD its flat config (every plugin resolved) before it can
+          # lint anything. The scaffold ships eslint.config.js whose peer deps must
+          # be in package.json + the lockfile, or `npm ci` won't install them and
+          # eslint crashes cryptically. Turn that into an actionable error instead.
+          PEERS='eslint @eslint/js typescript-eslint eslint-plugin-import-x eslint-plugin-unused-imports'
+          if [ -f eslint.config.js ]; then
+            if ! npx --no-install eslint --version >/dev/null 2>&1; then
+              echo "::error file=eslint.config.js::eslint is not installed. Run: npm i -D $PEERS  — then commit package-lock.json (CI installs from the lockfile)."
+              exit 1
+            fi
+            # Confirm the flat config actually loads — catches a missing PLUGIN dep
+            # (eslint --version passes even when a plugin import would fail).
+            if ! npx --no-install eslint --print-config eslint.config.js >/dev/null 2>cfg.err; then
+              echo "::error file=eslint.config.js::eslint.config.js failed to load — a peer dependency is likely missing. Run: npm i -D $PEERS (commit the lockfile)."
+              sed 's/^/  /' cfg.err >&2 || true
+              exit 1
+            fi
+          fi
+          # Portable NUL read (bash 3.2-safe — same idiom as the check-* scripts).
+          js=()
+          while IFS= read -r -d '' f; do case "$f" in *.ts|*.tsx|*.js|*.jsx|*.cjs|*.mjs|*.vue) js+=("$f") ;; esac; done <changed.nul
+          if [ ${#js[@]} -eq 0 ]; then echo "no changed JS/TS files — skipping eslint"; exit 0; fi
+          printf 'eslint: linting %d changed file(s)\n' "${#js[@]}"
+          npx --no-install eslint -- "${js[@]}"
+      - name: Format check (prettier --check)
+        if: steps.detect.outputs.present == 'true'
+        # Mirrors the pre-commit hook. Only runs when a prettier config is present
+        # AND prettier is installed — prettier formats, eslint checks correctness,
+        # and the two intentionally don't overlap (no eslint-config-prettier).
+        run: |
+          if { [ -f .prettierrc ] || [ -f .prettierrc.json ] || [ -f .prettierrc.js ] || [ -f prettier.config.js ]; } \
+             && npx --no-install prettier --version >/dev/null 2>&1; then
+            changed=()
+            while IFS= read -r -d '' f; do changed+=("$f"); done <changed.nul
+            if [ ${#changed[@]} -eq 0 ]; then echo "no changed files — skipping format check"; exit 0; fi
+            # --ignore-unknown lets prettier skip types it can't format, so passing
+            # every changed path is safe. Changed-files-only mirrors the rest of the
+            # workflow so a fresh install never format-fails pre-existing files.
+            npx --no-install prettier --check --ignore-unknown -- "${changed[@]}"
+          else
+            echo "no prettier config or prettier not installed — skipping format check"
+          fi
+      - name: Type-check (tsc --noEmit)
+        if: steps.detect.outputs.present == 'true'
+        # Project-wide type-check, guarded: only runs when a tsconfig.json is
+        # present AND TypeScript is installed — mirrors the pre-commit hook so
+        # the two layers stay in lockstep. coding-rules.md rule 9 mandates a
+        # type-checker; this is where it runs server-side.
+        run: |
+          # NOTE: a type-check is inherently WHOLE-PROGRAM (types are interdependent),
+          # so unlike eslint/ruff it can't be diff-scoped. If a freshly-installed
+          # project has pre-existing type errors, narrow tsconfig "include" or fix
+          # them — this is a real correctness signal, not lint noise.
+          if [ -f tsconfig.json ] && npx --no-install tsc --version >/dev/null 2>&1; then
+            npx --no-install tsc --noEmit
+          else
+            echo "tsconfig.json or typescript missing — skipping tsc type-check"
+          fi
+
+  php:
+    # Same detect-in-a-step pattern as `python` / `frontend`. No-ops on repos
+    # with no PHP, so it's safe to leave enabled in a polyglot org.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false  # don't leave GITHUB_TOKEN in .git/config
+      - id: detect
+        run: |
+          if [ -f composer.json ] || git ls-files '*.php' '*.phtml' | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.detect.outputs.present == 'true'
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240  # 2.37.2
+        with:
+          php-version: "8.3"
+          tools: composer
+      - name: Lint PHP (php -l syntax; phpcs when configured)
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          fail=0
+          git ls-files -z '*.php' '*.phtml' | xargs -0 -r -n1 php -l >/dev/null || fail=1
+          if [ -f composer.json ] && [ -f composer.lock ]; then
+            composer install --no-interaction --no-progress --prefer-dist || true
+          fi
+          if [ -x vendor/bin/phpcs ]; then vendor/bin/phpcs || fail=1; fi
+          exit $fail
+
+  # ── OPT-IN linter jobs for other languages ────────────────────────────────
+  # The forbidden-pattern + secret + size + hygiene guardrails below already run
+  # for EVERY language. These jobs add each language's real linter/type-checker.
+  # Uncomment the ones your team uses (actions are pinned to a commit SHA; the
+  # trailing comment is the version — bump via Dependabot). Each no-ops on repos
+  # that don't use that language.
+  #
+  # go:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+  #       with:
+  #         persist-credentials: false
+  #     - id: detect
+  #       run: '[ -f go.mod ] && echo "present=true" >> "$GITHUB_OUTPUT" || true'
+  #     - if: steps.detect.outputs.present == 'true'
+  #       uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+  #       with:
+  #         go-version: stable
+  #     - if: steps.detect.outputs.present == 'true'
+  #       run: go vet ./...
+  #     - if: steps.detect.outputs.present == 'true'
+  #       uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee  # v9.2.1
+  #
+  # rust:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+  #       with:
+  #         persist-credentials: false
+  #     - id: detect
+  #       run: '[ -f Cargo.toml ] && echo "present=true" >> "$GITHUB_OUTPUT" || true'
+  #     - if: steps.detect.outputs.present == 'true'
+  #       uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+  #       with:
+  #         components: clippy
+  #     - if: steps.detect.outputs.present == 'true'
+  #       run: cargo clippy --all-targets -- -D warnings
+  #
+  # java:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+  #       with:
+  #         persist-credentials: false
+  #     - id: detect
+  #       run: '{ [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; } && echo "present=true" >> "$GITHUB_OUTPUT" || true'
+  #     - if: steps.detect.outputs.present == 'true'
+  #       uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654  # v5.2.0
+  #       with:
+  #         distribution: temurin
+  #         java-version: "21"
+  #     # Wire your build's check goal, e.g. `mvn -B checkstyle:check` or
+  #     # `./gradlew check` (Gradle picks up ktlint/spotless/detekt for Kotlin).
+  #     - if: steps.detect.outputs.present == 'true'
+  #       run: echo "add your build's lint/check task here (mvn checkstyle:check / ./gradlew check)"
+  #
+  # ruby:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+  #       with:
+  #         persist-credentials: false
+  #     - id: detect
+  #       run: '[ -f Gemfile ] && echo "present=true" >> "$GITHUB_OUTPUT" || true'
+  #     - if: steps.detect.outputs.present == 'true'
+  #       uses: ruby/setup-ruby@12fd324f1d0b43274fdc8130f6980590a667c455  # v1.312.0
+  #       with:
+  #         ruby-version: "3.3"
+  #         bundler-cache: true
+  #     - if: steps.detect.outputs.present == 'true'
+  #       run: bundle exec rubocop
+
+  guardrails:
+    # File size, forbidden patterns, blocked filenames, secret scan —
+    # the same lib/check-* scripts the pre-commit hook calls.
+    #
+    # SCOPE: secrets + credential-filenames scan the WHOLE tree (catching an
+    # already-committed secret/key is the point, and they're the non-overridable
+    # security boundary). size + forbidden-patterns + hygiene scan only the
+    # PR/push DIFF, so installing the scaffold onto an existing repo doesn't
+    # retroactively fail its pre-existing code — only new/changed code is gated.
+    # fetch-depth: 0 (below) gives the diff a base.
+    #
+    # Two limitations to know about (both inherent to how this job is wired,
+    # not bugs you can patch in the script):
+    #
+    #   1. Runs the check scripts AND pattern configs from the PR head. On a
+    #      `pull_request` build the checked-out tree is the PR's own content, so
+    #      a PR can weaken the very scanner meant to gate it (edit a check-*
+    #      script, delete a pattern from .forbidden-patterns/*, or add a
+    #      `.scaffold.toml` that disables/downgrades a rule). The override file
+    #      is committed and the "active rule overrides" step below prints it into
+    #      the log, so a weakened rule is visible in review — but treat changes
+    #      to .scaffold.toml and .githooks/** as security-relevant. This is a
+    #      defense-in-depth backstop, NOT a trust boundary against a hostile
+    #      contributor — pair it with branch protection / required review, and
+    #      for untrusted forks gate merges on a scan run from the BASE ref
+    #      (e.g. check out `${{ github.base_ref }}`'s .githooks + configs and
+    #      run those against the PR's files). Note: secrets/credential-filename
+    #      blocking is NOT overridable by .scaffold.toml, by design.
+    #
+    #   2. Scans the committed blob (`git show :0:<path>`). For a Git-LFS- or
+    #      clean/smudge-filtered file the committed blob is the POINTER, not the
+    #      real content, so LFS-tracked text is not meaningfully scanned here.
+    #      If your repo keeps scannable text in LFS, add `lfs: true` to the
+    #      checkout below and scan the smudged working tree for those paths.
+    runs-on: ubuntu-latest
+    env:
+      EVENT: ${{ github.event_name }}
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PUSH_BEFORE: ${{ github.event.before }}
+      PUSH_AFTER: ${{ github.event.after }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false  # don't leave GITHUB_TOKEN in .git/config
+          fetch-depth: 0              # full history so the PR/push diff resolves
+      - name: Show active rule overrides (.scaffold.toml)
+        # Print every per-project override into the log so a disabled or
+        # downgraded rule is visible in review, not silent. Informational only.
+        run: |
+          chmod +x .githooks/lib/scaffold-audit 2>/dev/null || true
+          if [ -x .githooks/lib/scaffold-audit ]; then .githooks/lib/scaffold-audit; fi
+      - name: Run scaffold checks
+        run: |
+          chmod +x .githooks/lib/* 2>/dev/null || true
+          # Two scopes (see the job header):
+          #  • ALL_LIST  — whole tree: secrets + credential-filenames. Catching an
+          #    already-committed secret/key is the point; these are the
+          #    non-overridable security boundary.
+          #  • CHANGED_LIST — PR/push diff: size + forbidden-patterns + hygiene. So
+          #    installing onto an existing repo never retroactively fails legacy
+          #    code; only new/changed code is gated.
+          # -z (NUL-delimited) so a filename with a newline/tab/quote can't split
+          # the list. The check scripts read each file's committed blob
+          # (git show ":0:<path>") — exactly what the pre-commit hook sees.
+          ALL_LIST=$(mktemp)
+          git -c core.quotepath=off ls-files -z >"$ALL_LIST"
+          CHANGED_LIST=$(mktemp)
+          # Shared helper: PR/push diff, failing open to the whole tree when there
+          # is no diff base (so a brand-new repo still gets fully scanned).
+          .githooks/lib/ci-changed-files >"$CHANGED_LIST"
+          FAILED=0
+          # Whole-tree security boundary (not overridable by .scaffold.toml):
+          .githooks/lib/check-secrets   --ci <"$ALL_LIST"     || FAILED=1
+          .githooks/lib/check-filenames --ci <"$ALL_LIST"     || FAILED=1
+          # Changed-files-only quality gates:
+          .githooks/lib/check-size      --ci <"$CHANGED_LIST" || FAILED=1
+          .githooks/lib/check-patterns  --ci <"$CHANGED_LIST" || FAILED=1
+          .githooks/lib/check-hygiene   --ci <"$CHANGED_LIST" || FAILED=1
+          rm -f "$ALL_LIST" "$CHANGED_LIST"
+          exit $FAILED

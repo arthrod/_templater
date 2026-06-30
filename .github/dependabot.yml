@@ -1,0 +1,20 @@
+# Dependabot keeps the SHA-pinned GitHub Actions in this repo's workflows fresh.
+# SHA pins (supply-chain hardening) don't auto-update, so without this they rot;
+# Dependabot understands a `uses: owner/action@<sha>  # vX.Y.Z` pin natively and
+# bumps both the SHA and the trailing version comment in one grouped PR.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait 7 days before proposing a new release — long enough that a
+    # compromised-and-yanked version (chalk/debug, Shai-Hulud) is gone before we
+    # ever see the PR. Security updates bypass the cooldown.
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
